@@ -29,7 +29,7 @@ except ImportError:
 # BeamNG imports
 try:
     from beamngpy import BeamNGpy, Scenario, Vehicle
-    from beamngpy.sensors import Camera, GPS, IMU, Damage
+    from beamngpy.sensors import Camera, GPS, Damage
 except ImportError as e:
     print(f"Error importing BeamNGpy: {e}")
     print("Please ensure BeamNGpy is installed: pip install beamngpy")
@@ -128,13 +128,11 @@ class BeamNGConnection:
                           resolution=(640, 480))
             
             gps = GPS('gps_sensor')
-            imu = IMU('imu_sensor')
             damage = Damage('damage_sensor')
             
             # Attach sensors to vehicle
             self.vehicle.attach_sensor('camera', camera)
             self.vehicle.attach_sensor('gps', gps)
-            self.vehicle.attach_sensor('imu', imu)
             self.vehicle.attach_sensor('damage', damage)
             
             # Add vehicle to scenario at origin
