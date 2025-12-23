@@ -1,2 +1,17 @@
 *.code-workspace
 .vscode/
+
+# Python virtual environment
+venv/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+
+# Model checkpoints
+*.pth
+*.pt
+
+# Logs
+*.log
