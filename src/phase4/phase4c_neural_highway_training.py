@@ -307,12 +307,13 @@ class PersistentHighwayEnvironment:
     Uses scenario restart instead of full reload for speed
     """
     
-    def __init__(self, host='localhost', port=64256):
+    def __init__(self, host='localhost', port=25252):
         self.host = host
         self.port = port
         self.bng = None
         self.vehicle = None
         self.scenario = None
+        self.bng_home = "S:/SteamLibrary/steamapps/common/BeamNG.drive"
         
         # Episode tracking
         self.episode_origin = None
@@ -328,30 +329,53 @@ class PersistentHighwayEnvironment:
         self.max_distance = 0.0
         self.stationary_timer = 0.0
         
-    def connect(self):
-        """Connect to already-running BeamNG instance"""
+    def connect(self, auto_launch=True):
+        """Connect to already-running BeamNG instance (or launch if needed)"""
         print("=" * 60)
         print("Phase 4C: Neural Highway Training (Persistent Instance)")
         print("=" * 60)
-        print(f"Connecting to BeamNG at {self.host}:{self.port}")
-        print("Make sure BeamNG.drive is already running!")
+        print("Searching for BeamNG instance...")
         print()
         
         try:
             set_up_simple_logging()
-            self.bng = BeamNGpy(self.host, self.port)
-            self.bng.open(launch=False)  # Connect to existing instance
-            print("Connected to running BeamNG instance!")
-            return True
+            
+            # Try common ports in order
+            common_ports = [64256, 25252, self.port] if self.port not in [64256, 25252] else [64256, 25252]
+            
+            for port in common_ports:
+                try:
+                    print(f"Trying port {port}...", end=" ")
+                    self.bng = BeamNGpy(self.host, port, home=self.bng_home)
+                    self.bng.open(launch=False)
+                    self.port = port  # Update to working port
+                    print(f"✓ Connected on port {port}!")
+                    return True
+                except:
+                    print("✗")
+                    continue
+            
+            # No running instance found, launch new one
+            if auto_launch:
+                print("\nNo running instance found on any port.")
+                print("Launching BeamNG.drive (this will take ~30 seconds)...")
+                self.bng = BeamNGpy(self.host, 64256, home=self.bng_home)
+                self.bng.open(launch=True)
+                self.port = 64256
+                print("✓ BeamNG launched successfully on port 64256!")
+                return True
+            else:
+                raise Exception("No running BeamNG instance found")
+                    
         except Exception as e:
-            print(f"ERROR: Could not connect to BeamNG: {e}")
+            print(f"\nERROR: Could not connect to BeamNG: {e}")
             print("\nTroubleshooting:")
-            print("1. Make sure BeamNG.drive is running")
-            print("2. Check that BeamNG is listening on port", self.port)
-            print("3. Try launching BeamNG with: bng.open(launch=True)")
+            print("1. Make sure BeamNG.drive is installed at:", self.bng_home)
+            print("2. Try running BeamNG manually first")
+            print("3. Ports tried:", common_ports)
             return False
     
-    def setup_scenario(self, map_name='automation_test_track'):
+    def setup_scenario(self, map_name='west_coast_usa'):
         """Setup highway scenario (only once)"""
         print(f"\nSetting up scenario on map: {map_name}")
         
@@ -366,18 +390,35 @@ class PersistentHighwayEnvironment:
             self.vehicle.sensors.attach('damage', Damage())
             self.vehicle.sensors.attach('gforces', GForces())
             
-            # Spawn position (will vary by map)
-            if map_name == 'automation_test_track':
-                spawn_pos = (0, 0, 0.5)
-                spawn_rot = (0, 0, 0, 1)
-            else:  # west_coast_usa fallback
+            # Use proven spawn positions (won't fall through map)
+            if map_name == 'west_coast_usa':
+                # Proven coordinates from Phase 2
                 spawn_pos = (-717.121, 101, 118.675)
                 spawn_rot = (0, 0, 0.3826834, 0.9238795)
+            elif map_name == 'automation_test_track':
+                # Test track spawn (needs validation - fallback to west_coast if issues)
+                spawn_pos = (387.5, -2.5, 40.8)
+                spawn_rot = (0, 0, 0.9238795, 0.3826834)
+            else:
+                # Generic fallback
+                spawn_pos = (0, 0, 100)
+                spawn_rot = (0, 0, 0, 1)
             
             self.scenario.add_vehicle(self.vehicle, pos=spawn_pos, rot_quat=spawn_rot)
             
             print("Building scenario...")
             self.scenario.make(self.bng)
+            
+            print("Setting performance optimizations...")
+            # Speed up physics and reduce graphics load
+            self.bng.settings.set_deterministic(60)  # 60Hz physics (consistent)
+            
+            # Disable UI overlays for performance
+            try:
+                self.bng.settings.set_particles_enabled(False)
+                self.bng.settings.set_shadows_enabled(False)
+            except:
+                pass  # Older BeamNGpy versions may not have these
             
             print("Loading scenario...")
             self.bng.scenario.load(self.scenario)
@@ -385,8 +426,13 @@ class PersistentHighwayEnvironment:
             print("Starting scenario...")
             self.bng.scenario.start()
             
-            print("Physics stabilization (5 seconds)...")
-            time.sleep(5)
+            print("Physics stabilization (3 seconds)...")
+            time.sleep(3)  # Reduced from 5 to 3 seconds
+            
+            # Release parking brake and give initial throttle burst
+            self.vehicle.control(parkingbrake=0, throttle=1.0, steering=0, brake=0)
+            print("🚗 Parking brake released + initial throttle burst")
+            time.sleep(0.5)
             
             # Initialize tracking
             self.vehicle.sensors.poll()
@@ -414,7 +460,11 @@ class PersistentHighwayEnvironment:
         try:
             # Use BeamNG's restart function (faster than full reload)
             self.bng.scenario.restart()
-            time.sleep(2)  # Brief wait for physics
+            time.sleep(1)  # Reduced wait time - physics settles quickly
+            
+            # Release parking brake (automatic)
+            self.vehicle.control(parkingbrake=0)
+            time.sleep(0.2)
             
             # Reset tracking
             self.vehicle.sensors.poll()
@@ -428,13 +478,16 @@ class PersistentHighwayEnvironment:
             self.stationary_timer = 0.0
             self.episode_count += 1
             
-            print(f"Episode {self.episode_count} started at {pos}")
+            # Initial throttle burst to overcome inertia
+            self.vehicle.control(throttle=1.0, steering=0, brake=0, parkingbrake=0)
+            time.sleep(0.5)
+            print(f"Episode {self.episode_count} started (1s reset + throttle burst)")
             
         except Exception as e:
             print(f"WARNING: Reset failed: {e}")
             print("Attempting manual recovery...")
             self.vehicle.recover()
-            time.sleep(2)
+            time.sleep(1)
     
     def get_state(self) -> TrainingState:
         """Get current state for neural network"""
@@ -499,8 +552,9 @@ class PersistentHighwayEnvironment:
         steering = float(np.clip(action[1], -1, 1))
         brake = float(np.clip(action[2], 0, 1))
         
-        self.vehicle.control(throttle=throttle, steering=steering, brake=brake)
-        time.sleep(0.5)  # 2 Hz control
+        # Control vehicle (parking brake always off - AI doesn't control)
+        self.vehicle.control(throttle=throttle, steering=steering, brake=brake, parkingbrake=0)
+        time.sleep(0.3)  # 3.3 Hz control (faster than 2 Hz, still stable)
         
         # Get next state
         next_state = self.get_state()
@@ -531,10 +585,17 @@ class PersistentHighwayEnvironment:
     def _calculate_reward(self, current_state, next_state):
         """Calculate reward with distance-based progressive system"""
         reward = 0.0
-        info = {'crash_detected': False, 'stationary_timeout': False}
+        info = {
+            'crash_detected': False, 
+            'stationary_timeout': False,
+            'speed': next_state.speed,
+            'distance_progress': 0.0
+        }
         
         # Distance reward (primary)
         distance_progress = next_state.distance_from_checkpoint - current_state.distance_from_checkpoint
+        info['distance_progress'] = distance_progress
+        
         if distance_progress > 0:
             reward += distance_progress * 0.5  # 0.5 points per meter
         
@@ -549,17 +610,17 @@ class PersistentHighwayEnvironment:
             info['crash_detected'] = True
             self.last_damage = next_state.damage
         
-        # Stationary penalty
+        # Stationary penalty - MORE AGGRESSIVE
         if next_state.speed < 0.5:
-            self.stationary_timer += 0.5
-            reward -= 0.1
-            if self.stationary_timer > 5.0:
+            self.stationary_timer += 0.3  # Accumulates faster
+            reward -= 0.5  # Bigger penalty per step
+            if self.stationary_timer > 3.0:  # Faster timeout (was 5.0)
                 info['stationary_timeout'] = True
                 reward -= 20.0
+                print(f"  ! STATIONARY TIMEOUT after {self.stationary_timer:.1f}s")
         else:
             self.stationary_timer = 0.0
         
-        info['distance_progress'] = distance_progress
         info['reward'] = reward
         
         return reward, info
@@ -623,11 +684,11 @@ def train_highway_neural(episodes=100, batch_size=64, replay_start_size=1000):
             while True:
                 # Get action
                 if len(replay_buffer) < replay_start_size:
-                    # Random exploration
+                    # Random exploration - MAXIMUM THROTTLE BIAS
                     action = np.array([
-                        np.random.uniform(0.2, 0.7),
-                        np.random.uniform(-0.3, 0.3),
-                        np.random.uniform(0, 0.1)
+                        np.random.uniform(0.7, 1.0),    # MUCH higher throttle (was 0.4-0.9)
+                        np.random.uniform(-0.4, 0.4),   # Moderate steering
+                        np.random.uniform(0, 0.02)      # Minimal brake (was 0-0.05)
                     ])
                 else:
                     # Use policy
@@ -643,12 +704,18 @@ def train_highway_neural(episodes=100, batch_size=64, replay_start_size=1000):
                 episode_steps += 1
                 state = next_state
                 
+                # Print progress every step during exploration
+                if len(replay_buffer) < replay_start_size:
+                    print(f"  Explore Step {episode_steps}: Speed={info.get('speed', 0):.1f} m/s, "
+                          f"Distance={info.get('distance_progress', 0):.1f}m, "
+                          f"Reward={reward:.2f}, Action=[T:{action[0]:.2f} S:{action[1]:.2f} B:{action[2]:.2f}]")
+                
                 # Train agent
                 if len(replay_buffer) >= replay_start_size and episode_steps % 2 == 0:
                     batch = replay_buffer.sample(batch_size)
                     losses = agent.update(batch)
                     
-                    if episode_steps % 10 == 0:
+                    if episode_steps % 5 == 0:  # More frequent updates (was 10)
                         print(f"  Step {episode_steps}: Reward={reward:.2f}, "
                               f"Actor Loss={losses['actor_loss']:.4f}, "
                               f"Distance={info.get('distance_progress', 0):.1f}m")
