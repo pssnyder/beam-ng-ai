@@ -1,0 +1,2 @@
+[2026-01-04 10:14:36] Training started: 100 episodes
+[2026-01-04 10:16:02] Training interrupted at episode 12

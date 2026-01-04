@@ -1,0 +1,5 @@
+[2026-01-03 20:02:19] Training started: 100 episodes
+[2026-01-03 20:02:26] New best distance: 1.4m in episode 1
+[2026-01-03 20:02:36] New best distance: 2.1m in episode 2
+[2026-01-03 20:03:40] New best distance: 2.1m in episode 8
+[2026-01-03 20:04:52] Training interrupted at episode 14

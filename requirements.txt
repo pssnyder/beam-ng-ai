@@ -4,11 +4,15 @@
 # Core BeamNG interface
 beamngpy
 
+# Computer vision for obstacle detection (Phase 4C)
+opencv-python
+
+# Deep learning (Phase 4B+)
+torch
+numpy
+
 # Future dependencies (will be added as needed):
 # stable-baselines3  # For RL training in Phase 6
-# opencv-python      # For advanced computer vision processing
-# numpy             # For numerical computations and array operations
 # pandas            # For data analysis and telemetry processing
 # matplotlib        # For plotting and visualization
-# torch             # For deep learning models
 # gymnasium         # For RL environment interface

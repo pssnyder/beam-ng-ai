@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Phase 4C: Neural Network Highway Training with Persistent BeamNG
-BeamNG AI Driver - SAC Neural Network Training on Highway
+Phase 5A: Single Waypoint Navigation (Built on Phase 4C)
+BeamNG AI Driver - Goal-Directed Navigation
 
-Features:
-- Connects to already-running BeamNG instance
-- SAC (Soft Actor-Critic) neural network training
-- Distance-based progressive rewards
-- Scenario restart for fast iteration (no full reload)
-- Experience replay buffer
-- Real-time training statistics
+Built on working Phase 4C code with additions:
+- Waypoint coordinates and navigation
+- 31D state space (27D + 4D navigation)
+- Waypoint progress rewards
+- Heading alignment bonus
 
 Usage:
 1. Launch BeamNG.drive manually
 2. Run this script - it will connect to the running instance
-3. Training begins immediately on highway map
+3. Training begins with waypoint navigation goal
 """
 
 import time
@@ -30,6 +28,20 @@ from datetime import datetime
 
 from beamngpy import BeamNGpy, Scenario, Vehicle, set_up_simple_logging
 from beamngpy.sensors import Electrics, Damage, GForces
+
+# ============================================================================
+# WAYPOINT NAVIGATION (Phase 5A Addition)
+# ============================================================================
+
+# Route 1: Two waypoints along the road (Phase 5A)
+WAYPOINT_ROUTE = [
+    {'pos': np.array([-730.0, 85.0, 118.5], dtype=np.float32), 'name': 'WP1: First Turn', 'radius': 20.0},
+    {'pos': np.array([-750.0, 65.0, 118.0], dtype=np.float32), 'name': 'WP2: Road Curve', 'radius': 20.0},
+]
+
+# Spawn position
+SPAWN_POS = (-717.121, 101.0, 118.675)
+SPAWN_ROT = (0, 0, 0.3826834, 0.9238795)
 
 # PyTorch for neural networks
 try:
@@ -362,7 +374,7 @@ class ExperienceReplay:
 
 @dataclass
 class TrainingState:
-    """Compact state representation for neural network"""
+    """Compact state representation for neural network - Phase 5A (31D)"""
     # Position and velocity (6)
     position: np.ndarray  # x, y, z
     velocity: np.ndarray  # vx, vy, vz
@@ -394,8 +406,14 @@ class TrainingState:
     crash_count: float
     stationary_time: float
     
+    # PHASE 5A: Navigation features (4D) - NEW
+    distance_to_waypoint: float = 0.0
+    bearing_to_waypoint: float = 0.0
+    heading_error: float = 0.0
+    waypoint_reached: float = 0.0
+    
     def to_vector(self) -> np.ndarray:
-        """Convert to flat numpy vector for neural network"""
+        """Convert to 31D numpy array for neural network (Phase 5A)"""
         return np.array([
             # Position (3)
             self.position[0], self.position[1], self.position[2],
@@ -404,12 +422,14 @@ class TrainingState:
             # Distance (3)
             self.distance_from_origin, self.distance_from_checkpoint, self.distance_delta,
             # Dynamics (15)
-            self.speed, self.throttle, self.steering, self.brake,
-            self.rpm, self.gear, self.wheelspeed,
-            self.gx, self.gy, self.gz,
+            self.speed, self.throttle, self.steering, self.brake, self.rpm,
+            self.gear, self.wheelspeed, self.gx, self.gy, self.gz,
             self.damage, self.abs_active, self.esc_active, self.tcs_active, self.fuel,
             # Episode (3)
-            self.episode_time, self.crash_count, self.stationary_time
+            self.episode_time, self.crash_count, self.stationary_time,
+            # PHASE 5A: Navigation (4)
+            self.distance_to_waypoint, self.bearing_to_waypoint,
+            self.heading_error, self.waypoint_reached
         ], dtype=np.float32)
 
 class PersistentHighwayEnvironment:
@@ -449,6 +469,44 @@ class PersistentHighwayEnvironment:
         self.last_throttle = 0.0
         self.last_steering = 0.0
         self.last_brake = 0.0
+    
+    def _calculate_waypoint_features(self, vehicle_pos):
+        """Calculate navigation features to current waypoint (Phase 5A)"""
+        # Get current waypoint from route
+        if self.current_waypoint_index >= len(WAYPOINT_ROUTE):
+            # All waypoints reached - navigate to last waypoint
+            self.current_waypoint_index = len(WAYPOINT_ROUTE) - 1
+        
+        waypoint = WAYPOINT_ROUTE[self.current_waypoint_index]
+        target_pos = waypoint['pos']
+        radius = waypoint['radius']
+        
+        # Distance to waypoint (2D, ignore Z)
+        dx = target_pos[0] - vehicle_pos[0]
+        dy = target_pos[1] - vehicle_pos[1]
+        distance = np.sqrt(dx**2 + dy**2)
+        
+        # Bearing to waypoint (radians, 0 = north)
+        bearing = np.arctan2(dx, dy)
+        
+        # Vehicle heading from direction vector
+        dir_vec = self.vehicle.state.get('dir', None)
+        if dir_vec is not None:
+            vehicle_heading = np.arctan2(dir_vec[0], dir_vec[1])
+        else:
+            vehicle_heading = 0.0
+        
+        # Heading error (normalized to [-pi, pi])
+        heading_error = bearing - vehicle_heading
+        while heading_error > np.pi:
+            heading_error -= 2 * np.pi
+        while heading_error < -np.pi:
+            heading_error += 2 * np.pi
+        
+        # Check if waypoint reached
+        reached = 1.0 if distance < radius else 0.0
+        
+        return distance, bearing, heading_error, reached
         
     def connect(self, auto_launch=True):
         """Connect to already-running BeamNG instance (or launch if needed)"""
@@ -643,10 +701,15 @@ class PersistentHighwayEnvironment:
             self.last_steering = 0.0
             self.last_brake = 0.0
             
+            # PHASE 5A: Reset waypoint progression
+            self.current_waypoint_index = 0
+            self.waypoints_reached = 0
+            
             # Initial throttle burst to overcome inertia
             self.vehicle.control(throttle=1.0, steering=0, brake=0, parkingbrake=0)
             time.sleep(0.5)
-            print(f"Episode {self.episode_count} started (1s reset + throttle burst)")
+            wp_name = WAYPOINT_ROUTE[0]['name']
+            print(f"Episode {self.episode_count} started - Target: {wp_name}")
             
         except Exception as e:
             print(f"WARNING: Reset failed: {e}")
@@ -709,6 +772,9 @@ class PersistentHighwayEnvironment:
         else:
             gear_float = float(gear_value) if gear_value is not None else 0.0
         
+        # PHASE 5A: Calculate waypoint navigation features
+        dist_to_wp, bearing_to_wp, heading_err, wp_reached = self._calculate_waypoint_features(pos)
+        
         return TrainingState(
             position=pos,
             velocity=vel,
@@ -732,7 +798,12 @@ class PersistentHighwayEnvironment:
             fuel=electrics.get('fuel', 1.0),
             episode_time=time.time() - self.episode_start_time,
             crash_count=float(self.crash_count),
-            stationary_time=self.stationary_timer
+            stationary_time=self.stationary_timer,
+            # PHASE 5A: Navigation features
+            distance_to_waypoint=dist_to_wp,
+            bearing_to_waypoint=bearing_to_wp,
+            heading_error=heading_err,
+            waypoint_reached=wp_reached
         )
     
     def step(self, action: np.ndarray):
@@ -744,6 +815,14 @@ class PersistentHighwayEnvironment:
         throttle = float(np.clip(action[0], 0, 1))
         steering = float(np.clip(action[1], -1, 1))
         brake = float(np.clip(action[2], 0, 1))
+        
+        # ENFORCE: Prevent simultaneous throttle+brake (mutual exclusivity)
+        if throttle > 0.1 and brake > 0.1:
+            # If both are active, zero out the smaller one
+            if throttle > brake:
+                brake = 0.0  # Keep throttle, cancel brake
+            else:
+                throttle = 0.0  # Keep brake, cancel throttle
         
         # Calculate control smoothness (penalize jerky inputs)
         throttle_delta = abs(throttle - self.last_throttle)
@@ -775,6 +854,18 @@ class PersistentHighwayEnvironment:
         
         # Get next state
         next_state = self.get_state()
+        
+        # PHASE 5A: Check if waypoint reached and advance
+        if next_state.waypoint_reached > 0.5 and self.current_waypoint_index < len(WAYPOINT_ROUTE):
+            self.waypoints_reached += 1
+            waypoint_name = WAYPOINT_ROUTE[self.current_waypoint_index]['name']
+            print(f"\n  ✓ WAYPOINT REACHED: {waypoint_name} ({self.waypoints_reached}/{self.total_waypoints})")
+            
+            # Advance to next waypoint
+            self.current_waypoint_index += 1
+            if self.current_waypoint_index < len(WAYPOINT_ROUTE):
+                next_wp = WAYPOINT_ROUTE[self.current_waypoint_index]
+                print(f"  → Next target: {next_wp['name']}")
         
         # Calculate reward (pass control deltas for smoothness penalty)
         reward, info = self._calculate_reward(
@@ -869,7 +960,7 @@ class PersistentHighwayEnvironment:
     def _calculate_reward(self, current_state, next_state, 
                          throttle, steering, brake,
                          throttle_delta, steering_delta, brake_delta):
-        """Calculate reward with distance-based progressive system + smoothness penalties"""
+        """Calculate reward with waypoint navigation + smoothness penalties (Phase 5A)"""
         reward = 0.0
         info = {
             'crash_detected': False, 
@@ -878,15 +969,40 @@ class PersistentHighwayEnvironment:
             'speeding': False,
             'stuck': False,
             'speed': next_state.speed,
-            'distance_progress': 0.0
+            'distance_progress': 0.0,
+            'waypoint_reached': False  # Phase 5A
         }
         
-        # Distance reward (primary)
+        # PHASE 5A: Waypoint progress reward (PRIORITY)
+        waypoint_progress = current_state.distance_to_waypoint - next_state.distance_to_waypoint
+        if waypoint_progress > 0:
+            reward += waypoint_progress * 1.0  # 1.0 points per meter toward waypoint
+            info['waypoint_progress'] = waypoint_progress
+        
+        # PHASE 5A: Heading alignment bonus
+        heading_alignment = np.cos(next_state.heading_error)
+        if waypoint_progress > 0:  # Only when making progress
+            reward += heading_alignment * 0.3  # Up to +0.3 for pointing correctly
+        
+        # PHASE 5A: Waypoint reached bonus (scales with progress)
+        if next_state.waypoint_reached > 0.5:
+            # Bonus increases for later waypoints (encourages completion)
+            waypoint_bonus = 100.0 * (self.current_waypoint_index + 1)
+            reward += waypoint_bonus
+            info['waypoint_reached'] = True
+            info['waypoint_bonus'] = waypoint_bonus
+            
+            # Route completion bonus (all waypoints)
+            if self.waypoints_reached >= self.total_waypoints:
+                reward += 500.0  # MASSIVE bonus for full route!
+                info['route_completed'] = True
+        
+        # Distance reward (secondary - kept for exploration)
         distance_progress = next_state.distance_from_checkpoint - current_state.distance_from_checkpoint
         info['distance_progress'] = distance_progress
         
         if distance_progress > 0:
-            reward += distance_progress * 0.5  # 0.5 points per meter
+            reward += distance_progress * 0.2  # Reduced from 0.5 (waypoint is priority)
         
         # Speed bonus (when making progress) - BUT penalize excessive speed
         speed_limit_ms = 30.0  # ~67 mph for highway (was 20 m/s / 45 mph - too conservative)
@@ -907,9 +1023,9 @@ class PersistentHighwayEnvironment:
             if steering_delta > 0.5:
                 info['jerky_steering'] = True
         
-        # 2. Penalize simultaneous brake + throttle (brake riding)
+        # 2. Penalize simultaneous brake + throttle (brake riding) - HEAVY PENALTY
         if throttle > 0.3 and brake > 0.3:  # Both inputs active
-            brake_riding_penalty = (throttle * brake) * 5.0  # Penalty scales with both inputs
+            brake_riding_penalty = (throttle * brake) * 15.0  # INCREASED from 5.0 - AI rides brakes too much
             reward -= brake_riding_penalty
             info['brake_riding'] = True
         
@@ -1042,7 +1158,7 @@ def train_highway_neural(episodes=100, batch_size=64, replay_start_size=3000):
         return
     
     # Initialize agent and replay buffer
-    state_dim = 27  # From TrainingState.to_vector() - no vision
+    state_dim = 31  # Phase 5A: 27D base + 4D navigation (waypoint features)
     action_dim = 3  # throttle, steering, brake
     
     agent = SACAgent(state_dim=state_dim, action_dim=action_dim)
