@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Phase 5A: Single Waypoint Navigation (Built on Phase 4C)
-BeamNG AI Driver - Goal-Directed Navigation
+Phase 5B: Road Awareness Features (Built on Phase 5A)
+BeamNG AI Driver - Surface Detection & Trajectory Prediction
 
-Built on working Phase 4C code with additions:
-- Waypoint coordinates and navigation
-- 31D state space (27D + 4D navigation)
-- Waypoint progress rewards
-- Heading alignment bonus
+Built on Phase 5A with additions:
+- 41D state space (31D + 10D road awareness)
+- Wheel slip detection (asphalt vs off-road)
+- Surface roughness estimation (G-force variance)
+- Trajectory prediction (future position)
+- Path curvature analysis
+- Road quality scoring
 
 Usage:
 1. Launch BeamNG.drive manually
 2. Run this script - it will connect to the running instance
-3. Training begins with waypoint navigation goal
+3. AI learns road boundaries from friction/damage feedback
 """
 
 import time
@@ -243,7 +245,7 @@ class SACAgent:
 class TrainingMetrics:
     """Persistent training metrics and logging"""
     
-    def __init__(self, log_dir='training_logs', model_dir='models'):
+    def __init__(self, log_dir='training_logs', model_dir='models_phase5b'):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
         
@@ -374,7 +376,7 @@ class ExperienceReplay:
 
 @dataclass
 class TrainingState:
-    """Compact state representation for neural network - Phase 5A (31D)"""
+    """Compact state representation for neural network - Phase 5B (41D)"""
     # Position and velocity (6)
     position: np.ndarray  # x, y, z
     velocity: np.ndarray  # vx, vy, vz
@@ -406,14 +408,26 @@ class TrainingState:
     crash_count: float
     stationary_time: float
     
-    # PHASE 5A: Navigation features (4D) - NEW
+    # PHASE 5A: Navigation features (4D)
     distance_to_waypoint: float = 0.0
     bearing_to_waypoint: float = 0.0
     heading_error: float = 0.0
     waypoint_reached: float = 0.0
     
+    # PHASE 5B: Road awareness features (10D) - NEW
+    wheel_slip: float = 0.0              # wheelspeed/speed ratio (>1.1 = slip/off-road)
+    surface_roughness: float = 0.0        # G-force variance (high = rough terrain)
+    predicted_pos_x: float = 0.0          # Where we'll be in 2s (X)
+    predicted_pos_y: float = 0.0          # Where we'll be in 2s (Y)
+    path_curvature: float = 0.0           # Turning sharpness (steering * speed)
+    traction_loss: float = 0.0            # ABS+ESC+TCS combined indicator
+    lateral_acceleration: float = 0.0     # Sideways G-force (cornering)
+    braking_efficiency: float = 0.0       # Speed reduction per brake input
+    time_since_damage: float = 0.0        # Steps since last damage (road safety)
+    consecutive_clean_steps: float = 0.0  # Streak without damage (good road)
+    
     def to_vector(self) -> np.ndarray:
-        """Convert to 31D numpy array for neural network (Phase 5A)"""
+        """Convert to 41D numpy array for neural network (Phase 5B)"""
         return np.array([
             # Position (3)
             self.position[0], self.position[1], self.position[2],
@@ -429,7 +443,13 @@ class TrainingState:
             self.episode_time, self.crash_count, self.stationary_time,
             # PHASE 5A: Navigation (4)
             self.distance_to_waypoint, self.bearing_to_waypoint,
-            self.heading_error, self.waypoint_reached
+            self.heading_error, self.waypoint_reached,
+            # PHASE 5B: Road Awareness (10)
+            self.wheel_slip, self.surface_roughness,
+            self.predicted_pos_x, self.predicted_pos_y,
+            self.path_curvature, self.traction_loss,
+            self.lateral_acceleration, self.braking_efficiency,
+            self.time_since_damage, self.consecutive_clean_steps
         ], dtype=np.float32)
 
 class PersistentHighwayEnvironment:
@@ -474,6 +494,12 @@ class PersistentHighwayEnvironment:
         self.current_waypoint_index = 0
         self.waypoints_reached = 0
         self.total_waypoints = len(WAYPOINT_ROUTE)
+        
+        # PHASE 5B: Road awareness tracking
+        self.gforce_history = deque(maxlen=10)  # Last 10 steps for roughness calc
+        self.last_damage_step = 0  # Step count when damage last occurred
+        self.consecutive_clean_steps = 0  # Streak without damage
+        self.last_speed_for_braking = 0.0  # Track braking efficiency
     
     def _calculate_waypoint_features(self, vehicle_pos):
         """Calculate navigation features to current waypoint (Phase 5A)"""
@@ -512,6 +538,72 @@ class PersistentHighwayEnvironment:
         reached = 1.0 if distance < radius else 0.0
         
         return distance, bearing, heading_error, reached
+    
+    def _calculate_road_awareness(self, speed, wheelspeed, gx, gy, gz, steering, brake, damage):
+        """Calculate road awareness features from sensor data (Phase 5B)"""
+        
+        # 1. Wheel slip detection (asphalt vs off-road)
+        if speed > 1.0:  # Only meaningful when moving
+            wheel_slip = abs(wheelspeed) / speed if speed > 0 else 1.0
+            wheel_slip = min(wheel_slip, 3.0)  # Cap at 3.0 for extreme slip
+        else:
+            wheel_slip = 1.0  # Neutral when stationary
+        
+        # 2. Surface roughness (G-force variance over last 10 steps)
+        self.gforce_history.append((gx, gy, gz))
+        if len(self.gforce_history) >= 5:
+            g_magnitudes = [np.sqrt(x**2 + y**2 + z**2) for x, y, z in self.gforce_history]
+            surface_roughness = float(np.std(g_magnitudes))  # High = rough road
+        else:
+            surface_roughness = 0.0
+        
+        # 3. Trajectory prediction (where will we be in 2 seconds?)
+        current_pos = self.vehicle.state['pos']
+        vel = self.vehicle.state['vel']
+        predicted_x = current_pos[0] + vel[0] * 2.0
+        predicted_y = current_pos[1] + vel[1] * 2.0
+        
+        # 4. Path curvature (turning sharpness)
+        path_curvature = abs(steering * speed)  # High steering at speed = sharp turn
+        
+        # 5. Traction loss indicator (combined safety systems)
+        traction_loss = float(self.vehicle.sensors['electrics'].get('abs_active', 0.0) + 
+                             self.vehicle.sensors['electrics'].get('esc_active', 0.0) +
+                             self.vehicle.sensors['electrics'].get('tcs_active', 0.0))
+        
+        # 6. Lateral acceleration (sideways G-force from cornering)
+        lateral_acceleration = abs(gx)  # X-axis G-force = sideways
+        
+        # 7. Braking efficiency (how well brakes work on this surface)
+        if brake > 0.1 and self.last_speed_for_braking > speed:
+            speed_lost = self.last_speed_for_braking - speed
+            braking_efficiency = speed_lost / max(brake, 0.1)  # Speed loss per brake input
+        else:
+            braking_efficiency = 1.0  # Neutral
+        self.last_speed_for_braking = speed
+        
+        # 8. Time since last damage (road safety indicator)
+        if damage > self.last_damage:
+            self.last_damage_step = self.total_steps
+            self.consecutive_clean_steps = 0
+        else:
+            self.consecutive_clean_steps += 1
+        
+        time_since_damage = float(self.total_steps - self.last_damage_step)
+        consecutive_clean = float(min(self.consecutive_clean_steps, 100))  # Cap at 100
+        
+        return {
+            'wheel_slip': wheel_slip,
+            'surface_roughness': surface_roughness,
+            'predicted_pos_x': predicted_x,
+            'predicted_pos_y': predicted_y,
+            'path_curvature': path_curvature,
+            'traction_loss': traction_loss,
+            'lateral_acceleration': lateral_acceleration,
+            'braking_efficiency': braking_efficiency,
+            'time_since_damage': time_since_damage,
+            'consecutive_clean_steps': consecutive_clean
+        }
         
     def connect(self, auto_launch=True):
         """Connect to already-running BeamNG instance (or launch if needed)"""
@@ -789,6 +881,18 @@ class PersistentHighwayEnvironment:
         # PHASE 5A: Calculate waypoint navigation features
         dist_to_wp, bearing_to_wp, heading_err, wp_reached = self._calculate_waypoint_features(pos)
         
+        # PHASE 5B: Calculate road awareness features
+        road_features = self._calculate_road_awareness(
+            speed=speed,
+            wheelspeed=electrics.get('wheelspeed', 0.0),
+            gx=gforces.get('gx', 0.0),
+            gy=gforces.get('gy', 0.0),
+            gz=gforces.get('gz', 0.0),
+            steering=electrics.get('steering', 0.0),
+            brake=electrics.get('brake', 0.0),
+            damage=damage
+        )
+        
         return TrainingState(
             position=pos,
             velocity=vel,
@@ -817,7 +921,18 @@ class PersistentHighwayEnvironment:
             distance_to_waypoint=dist_to_wp,
             bearing_to_waypoint=bearing_to_wp,
             heading_error=heading_err,
-            waypoint_reached=wp_reached
+            waypoint_reached=wp_reached,
+            # PHASE 5B: Road awareness features
+            wheel_slip=road_features['wheel_slip'],
+            surface_roughness=road_features['surface_roughness'],
+            predicted_pos_x=road_features['predicted_pos_x'],
+            predicted_pos_y=road_features['predicted_pos_y'],
+            path_curvature=road_features['path_curvature'],
+            traction_loss=road_features['traction_loss'],
+            lateral_acceleration=road_features['lateral_acceleration'],
+            braking_efficiency=road_features['braking_efficiency'],
+            time_since_damage=road_features['time_since_damage'],
+            consecutive_clean_steps=road_features['consecutive_clean_steps']
         )
     
     def step(self, action: np.ndarray):
@@ -1176,7 +1291,7 @@ def train_highway_neural(episodes=100, batch_size=64, replay_start_size=3000):
         return
     
     # Initialize agent and replay buffer
-    state_dim = 31  # Phase 5A: 27D base + 4D navigation (waypoint features)
+    state_dim = 41  # Phase 5B: 27D base + 4D navigation + 10D road awareness
     action_dim = 3  # throttle, steering, brake
     
     agent = SACAgent(state_dim=state_dim, action_dim=action_dim)

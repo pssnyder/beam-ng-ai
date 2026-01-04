@@ -1,0 +1,1 @@
+Episode,Step,Timestamp,Speed_ms,Throttle,Steering,Brake,Damage,Damage_Increase,Total_Damage,Gx,Gy,Gz,Distance_From_Origin,Distance_From_Checkpoint,Position_X,Position_Y,Position_Z,Position_Delta,Stationary_Timer,Crash_Detected,Stationary_Timeout,Flipped,Reward,Event_Type
